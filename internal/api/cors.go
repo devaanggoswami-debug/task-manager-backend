@@ -2,14 +2,16 @@ package api
 
 import "net/http"
 
-// withCORS allows cross-origin calls from exactly one origin and answers
-// preflight requests without reaching the router.
+// withCORS allows cross-origin calls from exactly one origin, exposes the
+// list total header to it and answers preflight requests without reaching
+// the router.
 func withCORS(allowedOrigin string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Vary", "Origin")
 		originAllowed := allowedOrigin != "" && r.Header.Get("Origin") == allowedOrigin
 		if originAllowed {
 			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			w.Header().Set("Access-Control-Expose-Headers", totalCountHeader)
 		}
 
 		if r.Method == http.MethodOptions {
