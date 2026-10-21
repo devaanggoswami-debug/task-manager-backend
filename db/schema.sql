@@ -28,3 +28,46 @@ CREATE TABLE IF NOT EXISTS task_comments (
   created_at TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS task_comments_task_id_idx ON task_comments (task_id, id);
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category VARCHAR(20);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tasks_category_check') THEN
+    ALTER TABLE tasks ADD CONSTRAINT tasks_category_check
+      CHECK (category IS NULL OR category IN ('engineering','marketing','finance','sales','compliance'));
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS sprints (
+  id         BIGSERIAL PRIMARY KEY,
+  name       VARCHAR(100) NOT NULL CHECK (length(btrim(name)) > 0),
+  start_date DATE         NOT NULL,
+  end_date   DATE         NOT NULL,
+  created_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  CHECK (end_date >= start_date)
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  id         BIGSERIAL PRIMARY KEY,
+  name       VARCHAR(100) NOT NULL CHECK (length(btrim(name)) > 0),
+  created_at TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS projects_name_lower_idx ON projects (lower(name));
+
+CREATE TABLE IF NOT EXISTS sprint_tasks (
+  sprint_id BIGINT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+  task_id   BIGINT NOT NULL REFERENCES tasks(id)   ON DELETE CASCADE,
+  PRIMARY KEY (sprint_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS sprint_tasks_task_idx ON sprint_tasks (task_id);
+
+CREATE TABLE IF NOT EXISTS project_tasks (
+  project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  task_id    BIGINT NOT NULL REFERENCES tasks(id)    ON DELETE CASCADE,
+  PRIMARY KEY (project_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS project_tasks_task_idx ON project_tasks (task_id);
+
+ALTER TABLE sprints ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE RESTRICT;
+CREATE INDEX IF NOT EXISTS sprints_project_idx ON sprints (project_id, start_date, id);
+DROP INDEX IF EXISTS sprints_name_lower_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS sprints_project_name_lower_idx ON sprints (COALESCE(project_id, 0), lower(name));
