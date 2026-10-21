@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,13 +22,19 @@ type fakeStore struct {
 	mu            sync.Mutex
 	nextID        int64
 	nextCommentID int64
+	nextSprintID  int64
+	nextProjectID int64
 	tasks         map[int64]store.Task
 	comments      map[int64][]store.Comment
+	sprints       map[int64]store.Sprint
+	projects      map[int64]store.Project
 	err           error
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{nextID: 1, nextCommentID: 1, tasks: map[int64]store.Task{}, comments: map[int64][]store.Comment{}}
+	return &fakeStore{nextID: 1, nextCommentID: 1, nextSprintID: 1, nextProjectID: 1,
+		tasks: map[int64]store.Task{}, comments: map[int64][]store.Comment{},
+		sprints: map[int64]store.Sprint{}, projects: map[int64]store.Project{}}
 }
 
 func (f *fakeStore) List(context.Context) ([]store.Task, error) {
@@ -49,6 +56,94 @@ func (f *fakeStore) List(context.Context) ([]store.Task, error) {
 	return out, nil
 }
 
+func (f *fakeStore) ListFiltered(ctx context.Context, filter store.TaskFilter) ([]store.Task, error) {
+	all, err := f.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []store.Task{}
+	for _, t := range all {
+		if (filter.SprintID == 0 || slices.Contains(t.SprintIDs, filter.SprintID)) &&
+			(filter.ProjectID == 0 || slices.Contains(t.ProjectIDs, filter.ProjectID)) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// paginate mirrors LIMIT/OFFSET; a zero Limit keeps everything.
+func paginate[T any](items []T, p store.Page) []T {
+	if p.Limit == 0 {
+		return items
+	}
+	if p.Offset >= int64(len(items)) {
+		return []T{}
+	}
+	return items[p.Offset:min(p.Offset+p.Limit, int64(len(items)))]
+}
+
+func containsFold(s, sub string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
+}
+
+func (f *fakeStore) ListTasksPage(ctx context.Context, filter store.TaskFilter) ([]store.Task, int, error) {
+	all, err := f.ListFiltered(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := []store.Task{}
+	for _, t := range all {
+		category := store.Unclassified
+		if t.Category != nil {
+			category = *t.Category
+		}
+		if (filter.Status == "" || t.Status == filter.Status) &&
+			(filter.Category == "" || category == filter.Category) &&
+			(filter.Q == "" || containsFold(t.Assignee, filter.Q) || containsFold(t.Description, filter.Q)) &&
+			(filter.ExcludeSprintID == 0 || !slices.Contains(t.SprintIDs, filter.ExcludeSprintID)) {
+			out = append(out, t)
+		}
+	}
+	return paginate(out, filter.Page), len(out), nil
+}
+
+// withSprintProjects mirrors the Postgres store: a task in a sprint that
+// belongs to a project is also in that project.
+func (f *fakeStore) withSprintProjects(projectIDs, sprintIDs []int64) []int64 {
+	out := append([]int64{}, projectIDs...)
+	for _, id := range sprintIDs {
+		if p := f.sprints[id].ProjectID; p != nil {
+			out = append(out, *p)
+		}
+	}
+	return sortedIDs(out)
+}
+
+// checkIDs mirrors the Postgres store: unknown ids fail the whole write.
+func (f *fakeStore) checkIDs(in store.TaskInput) error {
+	var unknown store.UnknownIDsError
+	for _, id := range in.SprintIDs {
+		if _, ok := f.sprints[id]; !ok {
+			unknown.SprintIDs = append(unknown.SprintIDs, id)
+		}
+	}
+	for _, id := range in.ProjectIDs {
+		if _, ok := f.projects[id]; !ok {
+			unknown.ProjectIDs = append(unknown.ProjectIDs, id)
+		}
+	}
+	if len(unknown.SprintIDs) > 0 || len(unknown.ProjectIDs) > 0 {
+		return &unknown
+	}
+	return nil
+}
+
+func sortedIDs(ids []int64) []int64 {
+	out := append([]int64{}, ids...)
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
 func (f *fakeStore) Get(_ context.Context, id int64) (store.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -68,8 +163,13 @@ func (f *fakeStore) Create(_ context.Context, in store.TaskInput) (store.Task, e
 	if f.err != nil {
 		return store.Task{}, f.err
 	}
+	if err := f.checkIDs(in); err != nil {
+		return store.Task{}, err
+	}
 	now := time.Date(2026, 10, 20, 13, 0, 0, 0, time.UTC)
-	t := store.Task{ID: f.nextID, Assignee: in.Assignee, DueDate: in.DueDate, Description: in.Description, Status: in.Status, CreatedAt: now, UpdatedAt: now}
+	t := store.Task{ID: f.nextID, Assignee: in.Assignee, DueDate: in.DueDate, Description: in.Description, Status: in.Status,
+		Category: in.Category, SprintIDs: sortedIDs(in.SprintIDs), ProjectIDs: f.withSprintProjects(in.ProjectIDs, in.SprintIDs),
+		CreatedAt: now, UpdatedAt: now}
 	f.tasks[t.ID] = t
 	f.nextID++
 	return t, nil
@@ -85,7 +185,22 @@ func (f *fakeStore) Update(_ context.Context, id int64, in store.TaskInput) (sto
 	if !ok {
 		return store.Task{}, store.ErrNotFound
 	}
+	if err := f.checkIDs(in); err != nil {
+		return store.Task{}, err
+	}
 	t.Assignee, t.DueDate, t.Description, t.Status = in.Assignee, in.DueDate, in.Description, in.Status
+	if in.Category != nil {
+		t.Category = in.Category
+	}
+	if in.SprintIDs != nil {
+		t.SprintIDs = sortedIDs(in.SprintIDs)
+	}
+	if in.ProjectIDs != nil {
+		t.ProjectIDs = sortedIDs(in.ProjectIDs)
+	}
+	if in.SprintIDs != nil || in.ProjectIDs != nil {
+		t.ProjectIDs = f.withSprintProjects(t.ProjectIDs, t.SprintIDs)
+	}
 	t.UpdatedAt = t.UpdatedAt.Add(time.Minute)
 	f.tasks[id] = t
 	return t, nil
@@ -117,6 +232,14 @@ func (f *fakeStore) ListComments(_ context.Context, taskID int64) ([]store.Comme
 	return append([]store.Comment{}, f.comments[taskID]...), nil
 }
 
+func (f *fakeStore) ListCommentsPage(ctx context.Context, taskID int64, p store.Page) ([]store.Comment, int, error) {
+	all, err := f.ListComments(ctx, taskID)
+	if err != nil {
+		return nil, 0, err
+	}
+	return paginate(all, p), len(all), nil
+}
+
 func (f *fakeStore) CreateComment(_ context.Context, taskID int64, in store.CommentInput) (store.Comment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -131,6 +254,278 @@ func (f *fakeStore) CreateComment(_ context.Context, taskID int64, in store.Comm
 	f.comments[taskID] = append(f.comments[taskID], c)
 	f.nextCommentID++
 	return c, nil
+}
+
+func sameProject(a, b *int64) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
+}
+
+// checkSprint mirrors the Postgres constraints on a sprint write by sprint
+// self (0 for a new sprint).
+func (f *fakeStore) checkSprint(self int64, in store.SprintInput) error {
+	if in.ProjectID != nil {
+		if _, ok := f.projects[*in.ProjectID]; !ok {
+			return store.ErrUnknownProject
+		}
+	}
+	for _, s := range f.sprints {
+		if s.ID != self && sameProject(s.ProjectID, in.ProjectID) && strings.EqualFold(s.Name, in.Name) {
+			return store.ErrConflict
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) CreateSprint(_ context.Context, in store.SprintInput) (store.Sprint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Sprint{}, f.err
+	}
+	if err := f.checkSprint(0, in); err != nil {
+		return store.Sprint{}, err
+	}
+	return f.addSprint(in), nil
+}
+
+// addSprint stores a sprint without checks; a nil ProjectID makes a legacy
+// (pre-v5) sprint.
+func (f *fakeStore) addSprint(in store.SprintInput) store.Sprint {
+	s := store.Sprint{ID: f.nextSprintID, Name: in.Name, StartDate: in.StartDate, EndDate: in.EndDate, ProjectID: in.ProjectID,
+		CreatedAt: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}
+	f.sprints[s.ID] = s
+	f.nextSprintID++
+	return s
+}
+
+func (f *fakeStore) UpdateSprint(_ context.Context, id int64, in store.SprintInput) (store.Sprint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Sprint{}, f.err
+	}
+	s, ok := f.sprints[id]
+	if !ok {
+		return store.Sprint{}, store.ErrNotFound
+	}
+	if err := f.checkSprint(id, in); err != nil {
+		return store.Sprint{}, err
+	}
+	changed := in.ProjectID != nil && !sameProject(s.ProjectID, in.ProjectID)
+	s.Name, s.StartDate, s.EndDate, s.ProjectID = in.Name, in.StartDate, in.EndDate, in.ProjectID
+	f.sprints[id] = s
+	if changed {
+		for tid, t := range f.tasks {
+			if slices.Contains(t.SprintIDs, id) {
+				t.ProjectIDs = sortedIDs(append(t.ProjectIDs, *in.ProjectID))
+				f.tasks[tid] = t
+			}
+		}
+	}
+	return f.withSprintCount(s), nil
+}
+
+func (f *fakeStore) AddTasksToSprint(_ context.Context, sprintID int64, taskIDs []int64) (store.Sprint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Sprint{}, f.err
+	}
+	s, ok := f.sprints[sprintID]
+	if !ok {
+		return store.Sprint{}, store.ErrNotFound
+	}
+	var unknown []int64
+	for _, id := range taskIDs {
+		if _, ok := f.tasks[id]; !ok {
+			unknown = append(unknown, id)
+		}
+	}
+	if len(unknown) > 0 {
+		return store.Sprint{}, &store.UnknownIDsError{TaskIDs: sortedIDs(unknown)}
+	}
+	for _, id := range taskIDs {
+		t := f.tasks[id]
+		t.SprintIDs = sortedIDs(append(t.SprintIDs, sprintID))
+		t.ProjectIDs = f.withSprintProjects(t.ProjectIDs, []int64{sprintID})
+		f.tasks[id] = t
+	}
+	return f.withSprintCount(s), nil
+}
+
+func (f *fakeStore) RemoveTaskFromSprint(_ context.Context, sprintID, taskID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if _, ok := f.sprints[sprintID]; !ok {
+		return store.ErrSprintNotFound
+	}
+	t, ok := f.tasks[taskID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	i := slices.Index(t.SprintIDs, sprintID)
+	if i < 0 {
+		return store.ErrNotInSprint
+	}
+	t.SprintIDs = slices.Delete(slices.Clone(t.SprintIDs), i, i+1)
+	f.tasks[taskID] = t
+	return nil
+}
+
+func (f *fakeStore) withSprintCount(s store.Sprint) store.Sprint {
+	for _, t := range f.tasks {
+		if slices.Contains(t.SprintIDs, s.ID) {
+			s.TaskCount++
+		}
+	}
+	return s
+}
+
+func (f *fakeStore) ListSprints(context.Context) ([]store.Sprint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := []store.Sprint{}
+	for _, s := range f.sprints {
+		out = append(out, f.withSprintCount(s))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].StartDate.Equal(out[j].StartDate) {
+			return out[i].StartDate.Before(out[j].StartDate)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (f *fakeStore) ListSprintsPage(ctx context.Context, filter store.SprintFilter) ([]store.Sprint, int, error) {
+	all, err := f.ListSprints(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := []store.Sprint{}
+	for _, s := range all {
+		if (filter.ProjectID == 0 || (s.ProjectID != nil && *s.ProjectID == filter.ProjectID)) &&
+			(!filter.Unassigned || s.ProjectID == nil) {
+			out = append(out, s)
+		}
+	}
+	return paginate(out, filter.Page), len(out), nil
+}
+
+func (f *fakeStore) GetSprint(_ context.Context, id int64) (store.Sprint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Sprint{}, f.err
+	}
+	s, ok := f.sprints[id]
+	if !ok {
+		return store.Sprint{}, store.ErrNotFound
+	}
+	return f.withSprintCount(s), nil
+}
+
+func (f *fakeStore) CreateProject(_ context.Context, in store.ProjectInput) (store.Project, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Project{}, f.err
+	}
+	for _, p := range f.projects {
+		if strings.EqualFold(p.Name, in.Name) {
+			return store.Project{}, store.ErrConflict
+		}
+	}
+	p := store.Project{ID: f.nextProjectID, Name: in.Name, CreatedAt: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}
+	f.projects[p.ID] = p
+	f.nextProjectID++
+	return p, nil
+}
+
+func (f *fakeStore) UpdateProject(_ context.Context, id int64, in store.ProjectInput) (store.Project, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Project{}, f.err
+	}
+	p, ok := f.projects[id]
+	if !ok {
+		return store.Project{}, store.ErrNotFound
+	}
+	for _, other := range f.projects {
+		if other.ID != id && strings.EqualFold(other.Name, in.Name) {
+			return store.Project{}, store.ErrConflict
+		}
+	}
+	p.Name = in.Name
+	f.projects[id] = p
+	return f.withProjectCount(p), nil
+}
+
+func (f *fakeStore) withProjectCount(p store.Project) store.Project {
+	for _, t := range f.tasks {
+		if slices.Contains(t.ProjectIDs, p.ID) {
+			p.TaskCount++
+		}
+	}
+	for _, s := range f.sprints {
+		if s.ProjectID != nil && *s.ProjectID == p.ID {
+			p.SprintCount++
+		}
+	}
+	return p
+}
+
+func (f *fakeStore) ListProjects(context.Context) ([]store.Project, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := []store.Project{}
+	for _, p := range f.projects {
+		out = append(out, f.withProjectCount(p))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if a, b := strings.ToLower(out[i].Name), strings.ToLower(out[j].Name); a != b {
+			return a < b
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (f *fakeStore) ListProjectsPage(ctx context.Context, filter store.ProjectFilter) ([]store.Project, int, error) {
+	all, err := f.ListProjects(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := []store.Project{}
+	for _, p := range all {
+		if filter.Q == "" || containsFold(p.Name, filter.Q) {
+			out = append(out, p)
+		}
+	}
+	return paginate(out, filter.Page), len(out), nil
+}
+
+func (f *fakeStore) GetProject(_ context.Context, id int64) (store.Project, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.Project{}, f.err
+	}
+	p, ok := f.projects[id]
+	if !ok {
+		return store.Project{}, store.ErrNotFound
+	}
+	return f.withProjectCount(p), nil
 }
 
 const testOrigin = "http://localhost:3000"
@@ -385,7 +780,7 @@ func TestFallbackRoutesReturnJSON(t *testing.T) {
 		decode[errorResponse](t, rec)
 	}
 
-	for _, path := range []string{"/api/chat", "/api/tasks/1/comments/2", "/api/tasks/1/other"} {
+	for _, path := range []string{"/api/tasks/1/comments/2", "/api/tasks/1/other"} {
 		rec = do(t, h, "POST", path, `{"message":"hi"}`)
 		expectStatus(t, rec, http.StatusNotFound)
 		decode[errorResponse](t, rec)
