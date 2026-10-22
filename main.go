@@ -88,8 +88,11 @@ func run(logger *slog.Logger) error {
 		Handler:           api.NewHandler(store.NewPostgresStore(pool), cfg.corsOrigin, logger, assistant),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// WriteTimeout must exceed the assistant turn budget (assistantTimeout,
+		// 55s) so the handler can still write its reply after the Gemini client
+		// has used its full per-attempt timeout and retry budget.
+		WriteTimeout: 65 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	errCh := make(chan error, 1)

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -30,10 +31,26 @@ import (
 const DefaultModel = "gemini-3.8-flash"
 
 const (
-	defaultEndpoint        = "https://generativelanguage.googleapis.com"
-	defaultTimeout         = 10 * time.Second
+	defaultEndpoint = "https://generativelanguage.googleapis.com"
+	// defaultTimeout bounds a single HTTP attempt (not the whole call). The
+	// free-tier endpoint can be slow under load, so 10s was too tight. 15s
+	// gives a stalled-but-recoverable request room to finish while leaving the
+	// retry budget below time to run within the caller's deadline (the
+	// assistant handler allows 55s). The total call time stays bounded by the
+	// retry budget and the caller's context.
+	defaultTimeout         = 15 * time.Second
 	defaultMaxOutputTokens = 512
 	defaultTemperature     = 0.2
+
+	// Retry defaults. On a transient upstream failure (503/429/408, other
+	// 5xx, or a network/timeout error) the call is retried up to
+	// defaultMaxRetries extra times, waiting an exponentially growing,
+	// jittered delay (starting at defaultRetryBaseDelay, capped at
+	// defaultRetryMaxDelay) between attempts. Retries are few and the waits
+	// are capped so the total time stays bounded.
+	defaultMaxRetries     = 2
+	defaultRetryBaseDelay = 500 * time.Millisecond
+	defaultRetryMaxDelay  = 4 * time.Second
 
 	// maxResponseBytes caps the API response body we will read, so a
 	// misbehaving upstream cannot exhaust memory.
@@ -71,6 +88,9 @@ type Client struct {
 	maxOutputTokens int
 	temperature     float64
 	timeout         time.Duration
+	maxRetries      int
+	retryBaseDelay  time.Duration
+	retryMaxDelay   time.Duration
 	httpClient      *http.Client
 	limiter         *limiter
 }
@@ -94,6 +114,22 @@ func WithHTTPClient(h *http.Client) Option {
 // on the context alone.
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.timeout = d }
+}
+
+// WithRetry sets the retry budget and base backoff for transient failures.
+// maxRetries is the number of additional attempts after the first (clamped to
+// >= 0; 0 disables retries). baseDelay is the initial backoff, doubled each
+// retry with jitter and capped internally; a non-positive baseDelay retries
+// without waiting (useful in tests). The per-attempt timeout is unchanged and
+// still set with WithTimeout.
+func WithRetry(maxRetries int, baseDelay time.Duration) Option {
+	return func(c *Client) {
+		if maxRetries < 0 {
+			maxRetries = 0
+		}
+		c.maxRetries = maxRetries
+		c.retryBaseDelay = baseDelay
+	}
 }
 
 // WithMaxOutputTokens sets a conservative cap on generated tokens.
@@ -131,6 +167,9 @@ func New(apiKey, model string, opts ...Option) *Client {
 		maxOutputTokens: defaultMaxOutputTokens,
 		temperature:     defaultTemperature,
 		timeout:         defaultTimeout,
+		maxRetries:      defaultMaxRetries,
+		retryBaseDelay:  defaultRetryBaseDelay,
+		retryMaxDelay:   defaultRetryMaxDelay,
 		httpClient:      &http.Client{},
 		limiter:         newLimiter(float64(defaultRatePerMinute)/60, float64(defaultBurst)),
 	}
@@ -189,16 +228,47 @@ func (c *Client) Answer(ctx context.Context, systemInstruction, question string)
 	if c.apiKey == "" {
 		return "", ErrNotConfigured
 	}
+	// The local rate limiter is checked once per logical call, not per
+	// attempt: retries are a bounded recovery from a transient upstream
+	// failure, not new user requests, so they do not re-consume quota.
 	if c.limiter != nil && !c.limiter.allow(time.Now()) {
 		return "", fmt.Errorf("local rate limit exceeded: %w", ErrRateLimited)
 	}
 
-	if c.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.timeout)
-		defer cancel()
+	payload, err := c.marshalRequest(systemInstruction, question)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", ErrInvalidResponse)
 	}
+	url := c.endpoint + "/v1beta/models/" + c.model + ":generateContent"
 
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			// Back off before retrying, aborting early if the caller's
+			// context is cancelled or its deadline passes.
+			if err := c.waitBackoff(ctx, attempt-1); err != nil {
+				return "", lastErr
+			}
+		}
+
+		text, err, retryable := c.doAttempt(ctx, url, payload)
+		if err == nil {
+			return text, nil
+		}
+		lastErr = err
+		// Stop immediately on a permanent error (bad key, permission,
+		// unknown model, malformed request, unparseable body) or once the
+		// caller has given up. Only transient failures reach another
+		// iteration, and never more than c.maxRetries times.
+		if !retryable || ctx.Err() != nil {
+			return "", err
+		}
+	}
+	return "", lastErr
+}
+
+// marshalRequest builds the generateContent request body.
+func (c *Client) marshalRequest(systemInstruction, question string) ([]byte, error) {
 	body := genRequest{
 		Contents:         []genContent{{Role: "user", Parts: []genPart{{Text: question}}}},
 		GenerationConfig: genGenerationCfg{MaxOutputTokens: c.maxOutputTokens, Temperature: c.temperature},
@@ -206,15 +276,24 @@ func (c *Client) Answer(ctx context.Context, systemInstruction, question string)
 	if systemInstruction != "" {
 		body.SystemInstruction = &genContent{Parts: []genPart{{Text: systemInstruction}}}
 	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", ErrInvalidResponse)
+	return json.Marshal(body)
+}
+
+// doAttempt performs one HTTP attempt. It returns the reply text on success,
+// or an error wrapping a sentinel plus whether that error is transient and so
+// worth retrying.
+func (c *Client) doAttempt(ctx context.Context, url string, payload []byte) (string, error, bool) {
+	// Each attempt gets its own timeout derived from the caller's context, so
+	// a single stalled attempt cannot consume the whole retry budget.
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
 	}
 
-	url := c.endpoint + "/v1beta/models/" + c.model + ":generateContent"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", ErrUnavailable)
+		return "", fmt.Errorf("build request: %w", ErrUnavailable), false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// The key travels in a header, never the URL, so it stays out of logs.
@@ -223,51 +302,111 @@ func (c *Client) Answer(ctx context.Context, systemInstruction, question string)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil || isTimeout(err) {
-			return "", fmt.Errorf("request: %w", ErrTimeout)
+			// A timeout is transient; the caller-level check in Answer stops
+			// retries once the caller's own deadline is the one that tripped.
+			return "", fmt.Errorf("request: %w", ErrTimeout), true
 		}
-		return "", fmt.Errorf("request: %w", ErrUnavailable)
+		return "", fmt.Errorf("request: %w", ErrUnavailable), true
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("read body: %w", ErrTimeout)
+			return "", fmt.Errorf("read body: %w", ErrTimeout), true
 		}
-		return "", fmt.Errorf("read body: %w", ErrUnavailable)
+		return "", fmt.Errorf("read body: %w", ErrUnavailable), true
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", c.statusError(resp.StatusCode, data)
+		err, retryable := c.statusError(resp.StatusCode, data)
+		return "", err, retryable
 	}
 
 	var parsed genResponse
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", fmt.Errorf("decode response: %w", ErrInvalidResponse)
+		return "", fmt.Errorf("decode response: %w", ErrInvalidResponse), false
 	}
 	text := extractText(parsed)
 	if text == "" {
-		return "", fmt.Errorf("no text in response: %w", ErrInvalidResponse)
+		return "", fmt.Errorf("no text in response: %w", ErrInvalidResponse), false
 	}
-	return text, nil
+	return text, nil, false
 }
 
-// statusError classifies a non-200 response. The upstream message is included
+// statusError classifies a non-200 response into a sentinel error and reports
+// whether it is transient (worth retrying). The upstream message is included
 // for operator logs; it never contains the API key.
-func (c *Client) statusError(code int, data []byte) error {
+//
+// Retryable: 429/RESOURCE_EXHAUSTED (rate limited), 408 (request timeout), and
+// any 5xx (the 503 "model overloaded" case included). Not retryable: 400
+// (malformed request), 401/403 (bad key or permission), 404 (unknown model),
+// and any other 4xx — retrying those just wastes the budget on a deterministic
+// failure.
+func (c *Client) statusError(code int, data []byte) (error, bool) {
 	var e genErrorBody
 	_ = json.Unmarshal(data, &e)
 	detail := strings.TrimSpace(e.Error.Message)
 	if detail == "" {
 		detail = strings.TrimSpace(string(data))
 	}
-	if code == http.StatusTooManyRequests || e.Error.Status == "RESOURCE_EXHAUSTED" {
-		return fmt.Errorf("status %d: %s: %w", code, detail, ErrRateLimited)
+	switch {
+	case code == http.StatusTooManyRequests || e.Error.Status == "RESOURCE_EXHAUSTED":
+		return fmt.Errorf("status %d: %s: %w", code, detail, ErrRateLimited), true
+	case code == http.StatusRequestTimeout: // 408
+		return fmt.Errorf("status %d: %s: %w", code, detail, ErrTimeout), true
+	case code >= 500:
+		return fmt.Errorf("status %d: %s: %w", code, detail, ErrUnavailable), true
+	default:
+		return fmt.Errorf("status %d: %s: %w", code, detail, ErrInvalidResponse), false
 	}
-	if code >= 500 {
-		return fmt.Errorf("status %d: %s: %w", code, detail, ErrUnavailable)
+}
+
+// waitBackoff sleeps before retry number retryIndex (0 for the first retry),
+// returning the context error if the caller's context ends first.
+func (c *Client) waitBackoff(ctx context.Context, retryIndex int) error {
+	d := c.backoffDelay(retryIndex)
+	if d <= 0 {
+		return ctx.Err()
 	}
-	return fmt.Errorf("status %d: %s: %w", code, detail, ErrInvalidResponse)
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// backoffDelay computes the delay before retry retryIndex: an exponential
+// base*2^retryIndex, capped at retryMaxDelay, with equal jitter (a random
+// point in the upper half of that interval) to spread out concurrent retries.
+func (c *Client) backoffDelay(retryIndex int) time.Duration {
+	base := c.retryBaseDelay
+	if base <= 0 {
+		return 0
+	}
+	max := c.retryMaxDelay
+	if max <= 0 || max < base {
+		max = base
+	}
+	d := base
+	for i := 0; i < retryIndex; i++ {
+		if d >= max/2 { // doubling would reach or exceed the cap
+			d = max
+			break
+		}
+		d <<= 1
+	}
+	if d > max {
+		d = max
+	}
+	half := d / 2
+	if half <= 0 {
+		return d
+	}
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
 // extractText joins the text parts of the first candidate.

@@ -22,8 +22,10 @@ type Assistant interface {
 
 const (
 	// assistantTimeout bounds a single assistant turn. It is kept below the
-	// server's WriteTimeout so the handler can still write a reply.
-	assistantTimeout = 10 * time.Second
+	// server's WriteTimeout so the handler can still write a reply. It must be
+	// large enough for the Gemini client's bounded retries (up to 3 attempts
+	// at a 15s per-attempt timeout, plus short backoff waits) to complete.
+	assistantTimeout = 55 * time.Second
 
 	// assistantMaxTasks bounds how many tasks are packed into the model
 	// context, keeping the request small and predictable.
