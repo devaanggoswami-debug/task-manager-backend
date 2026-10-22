@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"taskmanager/backend/internal/api"
+	"taskmanager/backend/internal/gemini"
 	"taskmanager/backend/internal/store"
 )
 
@@ -21,6 +22,8 @@ type config struct {
 	databaseURL string
 	httpAddr    string
 	corsOrigin  string
+	geminiKey   string
+	geminiModel string
 }
 
 func loadConfig() config {
@@ -28,6 +31,11 @@ func loadConfig() config {
 		databaseURL: envOr("DATABASE_URL", "postgres://localhost:5432/taskmanager?sslmode=disable"),
 		httpAddr:    envOr("HTTP_ADDR", "127.0.0.1:8080"),
 		corsOrigin:  envOr("CORS_ORIGIN", "http://127.0.0.1:3100"),
+		// The key is optional: without it the chat assistant stays disabled
+		// and the chat endpoint returns its static help reply. It is read
+		// only from the environment and never logged.
+		geminiKey:   os.Getenv("GEMINI_API_KEY"),
+		geminiModel: envOr("GEMINI_MODEL", gemini.DefaultModel),
 	}
 }
 
@@ -65,9 +73,19 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	var assistant api.Assistant
+	if cfg.geminiKey != "" {
+		// Keep the assistant interface nil (not a typed nil) when disabled,
+		// so the handler's nil check works.
+		assistant = gemini.New(cfg.geminiKey, cfg.geminiModel)
+		logger.Info("chat assistant enabled", "model", cfg.geminiModel)
+	} else {
+		logger.Info("chat assistant disabled: GEMINI_API_KEY not set")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.httpAddr,
-		Handler:           api.NewHandler(store.NewPostgresStore(pool), cfg.corsOrigin, logger),
+		Handler:           api.NewHandler(store.NewPostgresStore(pool), cfg.corsOrigin, logger, assistant),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,

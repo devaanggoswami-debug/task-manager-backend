@@ -491,13 +491,18 @@ func (h *handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd := parseChat(msg, h.today())
-	resp := chatResponse{Reply: helpReply}
+	var resp chatResponse
 	var err error
 	switch cmd.kind {
 	case chatCreate:
 		resp, err = h.chatCreate(r.Context(), cmd.create)
 	case chatStatus:
 		resp, err = h.chatStatus(r.Context(), cmd.scope)
+	default:
+		// A message that is neither a create nor a status command is
+		// answered by the assistant, or the static help reply when no
+		// assistant is configured.
+		resp, err = h.chatAssistant(r.Context(), msg)
 	}
 	if err != nil {
 		h.internalError(w, r, err)

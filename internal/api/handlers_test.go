@@ -531,7 +531,7 @@ func (f *fakeStore) GetProject(_ context.Context, id int64) (store.Project, erro
 const testOrigin = "http://localhost:3000"
 
 func newTestHandler(s TaskStore) http.Handler {
-	return NewHandler(s, testOrigin, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewHandler(s, testOrigin, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {

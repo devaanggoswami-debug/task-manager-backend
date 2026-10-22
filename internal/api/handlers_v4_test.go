@@ -17,7 +17,7 @@ import (
 var fixedNow = time.Date(2026, 10, 21, 10, 0, 0, 0, time.Local)
 
 func newClockHandler(s TaskStore) http.Handler {
-	return newHandler(s, testOrigin, slog.New(slog.NewTextHandler(io.Discard, nil)), func() time.Time { return fixedNow })
+	return newHandler(s, testOrigin, slog.New(slog.NewTextHandler(io.Discard, nil)), func() time.Time { return fixedNow }, nil)
 }
 
 // seed creates legacy sprints S1 (around fixedNow) and S2, which belong to

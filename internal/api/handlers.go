@@ -159,20 +159,23 @@ func toCommentResponse(c store.Comment) commentResponse {
 }
 
 type handler struct {
-	store  TaskStore
-	logger *slog.Logger
-	now    func() time.Time
+	store     TaskStore
+	logger    *slog.Logger
+	now       func() time.Time
+	assistant Assistant
 }
 
-// NewHandler returns the API router wrapped in CORS middleware.
-func NewHandler(s TaskStore, corsOrigin string, logger *slog.Logger) http.Handler {
-	return newHandler(s, corsOrigin, logger, time.Now)
+// NewHandler returns the API router wrapped in CORS middleware. A nil
+// assistant disables the Gemini-backed chat fallback; the chat endpoint then
+// returns the static help reply for free-form messages.
+func NewHandler(s TaskStore, corsOrigin string, logger *slog.Logger, assistant Assistant) http.Handler {
+	return newHandler(s, corsOrigin, logger, time.Now, assistant)
 }
 
 // newHandler is NewHandler with an injectable clock; "today" is the
 // calendar date of now() in its own location.
-func newHandler(s TaskStore, corsOrigin string, logger *slog.Logger, now func() time.Time) http.Handler {
-	h := &handler{store: s, logger: logger, now: now}
+func newHandler(s TaskStore, corsOrigin string, logger *slog.Logger, now func() time.Time, assistant Assistant) http.Handler {
+	h := &handler{store: s, logger: logger, now: now, assistant: assistant}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/tasks", h.list)
 	mux.HandleFunc("POST /api/tasks", h.create)
