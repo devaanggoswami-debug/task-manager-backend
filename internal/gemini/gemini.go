@@ -38,9 +38,23 @@ const (
 	// retry budget below time to run within the caller's deadline (the
 	// assistant handler allows 55s). The total call time stays bounded by the
 	// retry budget and the caller's context.
-	defaultTimeout         = 15 * time.Second
-	defaultMaxOutputTokens = 512
+	defaultTimeout = 15 * time.Second
+	// defaultMaxOutputTokens caps the reply length. 256 tokens is ample for
+	// the assistant's concise, plain-text answers about tasks, and keeping it
+	// tight bounds latency and quota use. It must not be so low that answers
+	// are truncated; 256 leaves comfortable headroom for the replies this app
+	// produces. With thinking reduced to the lowest level (see
+	// defaultThinkingLevel) the model spends almost none of its work on
+	// internal reasoning, so more of a short budget reaches the answer.
+	defaultMaxOutputTokens = 256
 	defaultTemperature     = 0.2
+
+	// defaultThinkingLevel is the lowest reasoning effort supported by the
+	// default Gemini 3 model. It is sent as generationConfig.thinkingConfig.
+	// thinkingLevel on models that support it (see supportsThinkingLevel).
+	// "low" is deliberately not "minimal": the default model does not accept
+	// "minimal", so sending it would be rejected as an invalid parameter.
+	defaultThinkingLevel = "low"
 
 	// Retry defaults. On a transient upstream failure (503/429/408, other
 	// 5xx, or a network/timeout error) the call is retried up to
@@ -87,6 +101,7 @@ type Client struct {
 	endpoint        string
 	maxOutputTokens int
 	temperature     float64
+	thinkingLevel   string
 	timeout         time.Duration
 	maxRetries      int
 	retryBaseDelay  time.Duration
@@ -141,6 +156,15 @@ func WithMaxOutputTokens(n int) Option {
 	}
 }
 
+// WithThinkingLevel overrides the reasoning effort sent as
+// generationConfig.thinkingConfig.thinkingLevel. It is applied only to models
+// that support the parameter (see supportsThinkingLevel); on other models it
+// is ignored so no invalid parameter is sent. An empty value omits the
+// thinkingConfig entirely, leaving the model's own default in effect.
+func WithThinkingLevel(level string) Option {
+	return func(c *Client) { c.thinkingLevel = strings.TrimSpace(level) }
+}
+
 // WithRateLimit sets the local token-bucket limit: up to perMinute calls with
 // the given burst. A non-positive perMinute disables local throttling.
 func WithRateLimit(perMinute, burst int) Option {
@@ -166,6 +190,7 @@ func New(apiKey, model string, opts ...Option) *Client {
 		endpoint:        defaultEndpoint,
 		maxOutputTokens: defaultMaxOutputTokens,
 		temperature:     defaultTemperature,
+		thinkingLevel:   defaultThinkingLevel,
 		timeout:         defaultTimeout,
 		maxRetries:      defaultMaxRetries,
 		retryBaseDelay:  defaultRetryBaseDelay,
@@ -199,8 +224,16 @@ type genPart struct {
 }
 
 type genGenerationCfg struct {
-	MaxOutputTokens int     `json:"maxOutputTokens"`
-	Temperature     float64 `json:"temperature"`
+	MaxOutputTokens int                `json:"maxOutputTokens"`
+	Temperature     float64            `json:"temperature"`
+	ThinkingConfig  *genThinkingConfig `json:"thinkingConfig,omitempty"`
+}
+
+// genThinkingConfig carries the reasoning-effort control. It is attached only
+// for models that support thinkingLevel; omitempty on the pointer keeps it out
+// of the request otherwise.
+type genThinkingConfig struct {
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 }
 
 type genResponse struct {
@@ -272,6 +305,13 @@ func (c *Client) marshalRequest(systemInstruction, question string) ([]byte, err
 	body := genRequest{
 		Contents:         []genContent{{Role: "user", Parts: []genPart{{Text: question}}}},
 		GenerationConfig: genGenerationCfg{MaxOutputTokens: c.maxOutputTokens, Temperature: c.temperature},
+	}
+	// Apply the reasoning-effort control only where the model supports it, so a
+	// non-default GEMINI_MODEL never receives an invalid parameter. Models
+	// without thinkingLevel support (e.g. the Gemini 2.5 family, which uses a
+	// different thinkingBudget mechanism) are left on their own defaults.
+	if c.thinkingLevel != "" && supportsThinkingLevel(c.model) {
+		body.GenerationConfig.ThinkingConfig = &genThinkingConfig{ThinkingLevel: c.thinkingLevel}
 	}
 	if systemInstruction != "" {
 		body.SystemInstruction = &genContent{Parts: []genPart{{Text: systemInstruction}}}
@@ -419,6 +459,19 @@ func extractText(r genResponse) string {
 		b.WriteString(p.Text)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// supportsThinkingLevel reports whether model accepts the
+// generationConfig.thinkingConfig.thinkingLevel parameter. It is a feature of
+// the Gemini 3 family; the Gemini 2.5 family uses a different thinkingBudget
+// control, and older models have no thinking control at all. The check is
+// conservative — it returns false for anything it does not recognise — so an
+// unfamiliar GEMINI_MODEL is never sent a parameter it may reject. An optional
+// "models/" prefix is tolerated.
+func supportsThinkingLevel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	m = strings.TrimPrefix(m, "models/")
+	return strings.HasPrefix(m, "gemini-3")
 }
 
 func isTimeout(err error) bool {

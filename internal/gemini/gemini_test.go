@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,9 +59,147 @@ func TestAnswerSuccess(t *testing.T) {
 	if gotCT != "application/json" {
 		t.Fatalf("content-type = %q", gotCT)
 	}
-	for _, want := range []string{`"How is S1?"`, `"maxOutputTokens":512`, `"You are a helpful assistant."`} {
+	for _, want := range []string{
+		`"How is S1?"`,
+		`"maxOutputTokens":256`,
+		`"You are a helpful assistant."`,
+		`"thinkingConfig":{"thinkingLevel":"low"}`,
+	} {
 		if !strings.Contains(gotBody, want) {
 			t.Fatalf("request body missing %q: %s", want, gotBody)
+		}
+	}
+	// The default model must not be sent the unsupported "minimal" level.
+	if strings.Contains(gotBody, `"minimal"`) {
+		t.Fatalf("request body must not use the unsupported minimal level: %s", gotBody)
+	}
+}
+
+// captureServer returns a 200/okBody server that records the last request body
+// it received, for asserting on the generationConfig sent.
+func captureServer(body *string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*body = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, okBody)
+	}))
+}
+
+// TestThinkingLevelAppliedToGemini3 verifies the low thinking level is sent for
+// Gemini 3 models that support it, and never the unsupported "minimal".
+func TestThinkingLevelAppliedToGemini3(t *testing.T) {
+	for _, model := range []string{"gemini-3.8-flash", "gemini-3-pro", "models/gemini-3.8-flash"} {
+		t.Run(model, func(t *testing.T) {
+			var gotBody string
+			srv := captureServer(&gotBody)
+			defer srv.Close()
+
+			c := New("test-key", model, WithEndpoint(srv.URL), WithHTTPClient(srv.Client()), WithRateLimit(0, 0))
+			if _, err := c.Answer(context.Background(), "sys", "hi"); err != nil {
+				t.Fatalf("Answer: %v", err)
+			}
+			if !strings.Contains(gotBody, `"thinkingConfig":{"thinkingLevel":"low"}`) {
+				t.Fatalf("request missing low thinkingLevel: %s", gotBody)
+			}
+			if strings.Contains(gotBody, `"minimal"`) {
+				t.Fatalf("request must not use unsupported minimal level: %s", gotBody)
+			}
+		})
+	}
+}
+
+// TestThinkingLevelOmittedForUnsupportedModel verifies that a configured model
+// without thinkingLevel support is not sent the parameter, so GEMINI_MODEL
+// stays safely configurable.
+func TestThinkingLevelOmittedForUnsupportedModel(t *testing.T) {
+	for _, model := range []string{"gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-1.5-pro"} {
+		t.Run(model, func(t *testing.T) {
+			var gotBody string
+			srv := captureServer(&gotBody)
+			defer srv.Close()
+
+			c := New("test-key", model, WithEndpoint(srv.URL), WithHTTPClient(srv.Client()), WithRateLimit(0, 0))
+			if _, err := c.Answer(context.Background(), "sys", "hi"); err != nil {
+				t.Fatalf("Answer: %v", err)
+			}
+			if strings.Contains(gotBody, "thinkingConfig") || strings.Contains(gotBody, "thinkingLevel") {
+				t.Fatalf("unsupported model must not receive thinkingConfig: %s", gotBody)
+			}
+		})
+	}
+}
+
+// TestThinkingLevelConfigurable verifies WithThinkingLevel overrides the level,
+// and that an empty level omits the config even on a supported model.
+func TestThinkingLevelConfigurable(t *testing.T) {
+	t.Run("override to high", func(t *testing.T) {
+		var gotBody string
+		srv := captureServer(&gotBody)
+		defer srv.Close()
+
+		c := New("test-key", "gemini-3.8-flash", WithEndpoint(srv.URL), WithHTTPClient(srv.Client()),
+			WithRateLimit(0, 0), WithThinkingLevel("high"))
+		if _, err := c.Answer(context.Background(), "sys", "hi"); err != nil {
+			t.Fatalf("Answer: %v", err)
+		}
+		if !strings.Contains(gotBody, `"thinkingLevel":"high"`) {
+			t.Fatalf("expected high thinkingLevel: %s", gotBody)
+		}
+	})
+	t.Run("empty omits config", func(t *testing.T) {
+		var gotBody string
+		srv := captureServer(&gotBody)
+		defer srv.Close()
+
+		c := New("test-key", "gemini-3.8-flash", WithEndpoint(srv.URL), WithHTTPClient(srv.Client()),
+			WithRateLimit(0, 0), WithThinkingLevel(""))
+		if _, err := c.Answer(context.Background(), "sys", "hi"); err != nil {
+			t.Fatalf("Answer: %v", err)
+		}
+		if strings.Contains(gotBody, "thinkingConfig") {
+			t.Fatalf("empty level must omit thinkingConfig: %s", gotBody)
+		}
+	})
+}
+
+// TestThinkingLevelPresentAcrossQuotaRetries ties the two requirements
+// together: a 429 (quota) is retried, and every attempt — including the
+// recovering one — still carries the low thinking-level configuration.
+func TestThinkingLevelPresentAcrossQuotaRetries(t *testing.T) {
+	var calls int32
+	var bodies []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}`)
+			return
+		}
+		io.WriteString(w, okBody)
+	}))
+	defer srv.Close()
+
+	got, err := newTestClient(srv).Answer(context.Background(), "sys", "hi")
+	if err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if got != "recovered" {
+		t.Fatalf("reply = %q", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("got %d request bodies, want 2 (one 429, one success)", len(bodies))
+	}
+	for i, b := range bodies {
+		if !strings.Contains(b, `"thinkingConfig":{"thinkingLevel":"low"}`) {
+			t.Fatalf("attempt %d missing low thinkingLevel: %s", i, b)
 		}
 	}
 }
